@@ -6,6 +6,8 @@
 #include <XrdPfc/XrdPfc.hh>
 #include <unordered_set>
 
+#include <iostream>
+
 namespace XrdPfc
 {
 
@@ -13,7 +15,23 @@ enum class PurgePolicy {
     PastDel,
     PastExp,
     PastOpp,
-    PastDed
+    PastDed,
+    UnknownPolicy
+};
+
+struct PurgeDirCandidateStats {
+    PurgeDirCandidateStats() :
+        dir_b_to_purge{0},
+        dir_b_remaining{0}
+    {};
+    
+    PurgeDirCandidateStats(const long long toPurge, const long long remaining) :
+        dir_b_to_purge{toPurge},
+        dir_b_remaining{remaining}
+    {};
+
+    long long dir_b_to_purge;
+    long long dir_b_remaining;
 };
 
 std::string getPolicyName(PurgePolicy policy) {
@@ -31,6 +49,20 @@ std::string getPolicyName(PurgePolicy policy) {
     }
 }
 
+PurgePolicy getPolicyFromName(std::string policy) {
+    if (policy == "del") {
+        return PurgePolicy::PastDel;
+    } else if (policy == "exp") {
+        return PurgePolicy::PastExp;
+    } else if (policy == "opp") {
+        return PurgePolicy::PastOpp;
+    } else if (policy == "ded") {
+        return PurgePolicy::PastDed;
+    } else {
+        return PurgePolicy::UnknownPolicy;
+    }
+}
+
 class XrdPurgeLotMan : public PurgePin
 {
 public:
@@ -38,7 +70,41 @@ public:
     virtual ~XrdPurgeLotMan() override;
 
     const Configuration &conf = Cache::Conf();
+    class LotManConfiguration {
+    public:
+        LotManConfiguration() {}
+        LotManConfiguration(std::string lot_home, std::vector<PurgePolicy> policy) : m_lot_home(lot_home), m_policy{policy} {}
 
+        std::string GetLotHome() {
+            return m_lot_home;
+        }
+        void SetLotHome(std::string lot_home) {
+            m_lot_home = lot_home;
+        }
+        std::vector<PurgePolicy> GetPolicy() {
+            return m_policy;
+        }
+        void SetPolicy(std::vector<PurgePolicy> policy) {
+            m_policy = policy;
+        }
+
+    private:
+        std::string m_lot_home;
+        std::vector<PurgePolicy> m_policy;
+    };
+
+    static const std::map<PurgePolicy, void (XrdPurgeLotMan::*)(const DataFsPurgeshot&, long long&)> policyFunctionMap;
+
+    void applyPolicies(const DataFsPurgeshot &purge_shot, long long &bytesRemaining) {
+        for (const auto &policy : m_lotman_conf.GetPolicy()) {
+            std::cout << "BYTES REMAINING BEFORE " << getPolicyName(policy) << " POLICY: " << bytesRemaining << std::endl;
+            auto it = policyFunctionMap.find(policy);
+            if (it != policyFunctionMap.end()) {
+                (this->*(it->second))(purge_shot, bytesRemaining);
+            }
+            std::cout << std::endl;
+        }
+    }
     virtual long long GetBytesToRecover(const DataFsPurgeshot&) override;
     virtual bool ConfigPurgePin(const char* params) override;
 
@@ -54,11 +120,19 @@ public:
     long long GetConfiguredHWM();
     long long GetConfiguredLWM();
 
+    bool validateConfiguration(const char *params);
+    std::string getLotHome() {
+        return m_lotman_conf.GetLotHome();
+    }
+
     
 
 protected:
-    std::unordered_set<std::string> m_dirs_to_purge;
-    std::map<std::string, long long> m_dirs_to_purge_b_remaining;
+    // std::map<std::string, long long> m_dirs_to_purge_b;
+    // std::map<std::string, long long> m_dirs_to_purge_b_remaining;
+
+    std::map<std::string, std::unique_ptr<PurgeDirCandidateStats>> m_purge_dirs;
+    LotManConfiguration m_lotman_conf;
 
 private:
     // indicates that these tend to clean out an entire lot, such as lots past deletion/expiration
@@ -66,6 +140,17 @@ private:
     // whereas these only purge some of the storage, such as lots past opportunistic/dedicated storage
     void partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, PurgePolicy policy);
 
+
+
+
+};
+
+// Initialize the policyFunctionMap
+const std::map<PurgePolicy, void (XrdPurgeLotMan::*)(const DataFsPurgeshot&, long long&)> XrdPurgeLotMan::policyFunctionMap = {
+    {PurgePolicy::PastDel, &XrdPurgeLotMan::lotsPastDelPolicy},
+    {PurgePolicy::PastExp, &XrdPurgeLotMan::lotsPastExpPolicy},
+    {PurgePolicy::PastOpp, &XrdPurgeLotMan::lotsPastOppPolicy},
+    {PurgePolicy::PastDed, &XrdPurgeLotMan::lotsPastDedPolicy}
 };
 
 }

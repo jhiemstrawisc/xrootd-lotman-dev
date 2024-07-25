@@ -11,6 +11,7 @@
 
 #include <iostream>
 #include <string>
+#include <sstream>
 
 #include <filesystem>
 
@@ -148,9 +149,8 @@ json reconstructPathsAndBuildJson(const XrdPfc::DataFsPurgeshot &purge_shot) {
 
 namespace XrdPfc { 
 
-XrdPurgeLotMan::XrdPurgeLotMan()
-{
-}
+XrdPurgeLotMan::XrdPurgeLotMan() :
+    m_purge_dirs{} {}
 
 XrdPurgeLotMan::~XrdPurgeLotMan()
 {
@@ -281,7 +281,7 @@ void XrdPurgeLotMan::lotsPastDedPolicy(const DataFsPurgeshot &purgeShot, long lo
 }
 
 
-void XrdPurgeLotMan::completePurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, XrdPfc::PurgePolicy policy) 
+void XrdPurgeLotMan::completePurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &globalBRemaining, XrdPfc::PurgePolicy policy) 
 {
     char **lots;
     char *err;
@@ -308,46 +308,47 @@ void XrdPurgeLotMan::completePurgePolicyBase(const DataFsPurgeshot &purgeShot, l
     // Get directory usage for each of the directories tied to each lot
     for (int i = 0; lots[i] != nullptr; ++i)
     {
-        if (bytesRemaining == 0) {
+        if (globalBRemaining == 0) {
             break;
         }
 
         const std::string lotName = lots[i];
 
         std::map<std::string, long long> tmp_map = lotPerDirUsageB(lotName, purgeShot);
-        for (const auto& [dir, bytes] : tmp_map)
+        for (const auto& [dir, bytesInDir] : tmp_map)
         {
-            if (bytesRemaining <= 0) {
+            if (globalBRemaining <= 0) {
                 break;
             }
 
             long long toRecoverFromDir;
-            if (m_dirs_to_purge_b_remaining.find(dir) != m_dirs_to_purge_b_remaining.end()) {
+            if (m_purge_dirs.find(dir) != m_purge_dirs.end()) {
                 // There's nothing left to clean up in this directory
-                if (m_dirs_to_purge_b_remaining[dir] <= 0) {
+                if (m_purge_dirs[dir]->dir_b_remaining <= 0) {
                     continue;
                 }
                 // Clean out the rest of the dir, unless we don't have that much left to clear
-                toRecoverFromDir = std::min(m_dirs_to_purge_b_remaining[dir], bytesRemaining);
+                toRecoverFromDir = std::min(m_purge_dirs[dir]->dir_b_remaining, globalBRemaining);
             } else {
-                toRecoverFromDir = std::min(bytes, bytesRemaining);
-                m_dirs_to_purge_b_remaining[dir] = bytes;
+                toRecoverFromDir = std::min(bytesInDir, globalBRemaining);
+                m_purge_dirs[dir] = std::make_unique<PurgeDirCandidateStats>(PurgeDirCandidateStats(0ll, bytesInDir));
             }
 
-            std::cout << "dir: " << dir << " reported usage: " << bytes << " usage remaining: " << m_dirs_to_purge_b_remaining[dir] << " toRecoverFromDir: " << toRecoverFromDir << std::endl;
 
-            DirInfo update;
-            update.path = dir + "/"; // XRootD will seg fault if the path doesn't end in a slash
-            // update.path = dir; // XRootD will seg fault if the path doesn't end in a slash
+            m_purge_dirs[dir]->dir_b_to_purge += toRecoverFromDir;
+            globalBRemaining -= toRecoverFromDir;
+            m_purge_dirs[dir]->dir_b_remaining -= toRecoverFromDir;
 
-            update.nBytesToRecover = toRecoverFromDir;
-            bytesRemaining -= toRecoverFromDir;
-            m_dirs_to_purge_b_remaining[dir] -= toRecoverFromDir;
-            m_list.push_back(update);
+            std::cout << "   ADDING dir: " << dir << std::endl <<
+                "   dirUsage: " << bytesInDir <<  std::endl << 
+                "   bytes_to_purge: " << m_purge_dirs[dir]->dir_b_to_purge << std::endl << 
+                "   bytes_remaining: " << m_purge_dirs[dir]->dir_b_remaining << std::endl <<
+                "   toRecoverFromDir: " << toRecoverFromDir << std::endl <<
+                "   GlobalBRemaining: " << globalBRemaining << std::endl;
         }
     }
 
-    std::cout << "   BYTES REMAINING AFTER " << getPolicyName(policy) << " POLICY: " << bytesRemaining << std::endl;
+    std::cout << "   TOTAL B REMAINING AFTER " << getPolicyName(policy) << " POLICY: " << globalBRemaining << std::endl;
 
 
     return;
@@ -355,7 +356,7 @@ void XrdPurgeLotMan::completePurgePolicyBase(const DataFsPurgeshot &purgeShot, l
 }
 
 
-void XrdPurgeLotMan::partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, XrdPfc::PurgePolicy policy) 
+void XrdPurgeLotMan::partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &globalBRemaining, XrdPfc::PurgePolicy policy) 
 {
     char **lots;
     char *err;
@@ -384,7 +385,7 @@ void XrdPurgeLotMan::partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, lo
     // Get directory usage for each of the directories tied to each lot
     for (int i = 0; lots[i] != nullptr; ++i)
     {
-        if (bytesRemaining <= 0) {
+        if (globalBRemaining <= 0) {
             break;
         }
 
@@ -416,50 +417,65 @@ void XrdPurgeLotMan::partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, lo
         if (policy == XrdPfc::PurgePolicy::PastOpp) {
             double oppGB = usageJSON["opportunistic_GB"]["total"];
             toRecoverFromLot = static_cast<long long>((totalGB - dedGB - oppGB) * GB2B);
+            std::cout << "   TO RECOVER FROM LOT: " << lotName << " IS " << toRecoverFromLot << std::endl;
+            std::cout << "   TOTAL GB: " << totalGB << " DED GB: " << dedGB << " OPP GB: " << oppGB << std::endl;
+
+
         } else {
             toRecoverFromLot = static_cast<long long>((totalGB - dedGB) * GB2B);
+            std::cout << "   TO RECOVER FROM LOT: " << lotName << " IS " << toRecoverFromLot << std::endl;
+            std::cout << "   TOTAL GB: " << totalGB << " DED GB: " << dedGB  << std::endl;
         }
 
-        if (toRecoverFromLot > bytesRemaining) {
-            toRecoverFromLot = bytesRemaining;
+        if (toRecoverFromLot > globalBRemaining) {
+            toRecoverFromLot = globalBRemaining;
         }
 
         std::map<std::string, long long> tmp_usage = lotPerDirUsageB(lotName, purgeShot);
-        for (const auto& [dir, bytes] : tmp_usage)
+        for (const auto& [dir, bytesInDir] : tmp_usage)
         {
-            if (bytesRemaining <= 0 || toRecoverFromLot <= 0) {
+            if (globalBRemaining <= 0 || toRecoverFromLot <= 0) {
                 break;
             }
 
             long long toRecoverFromDir;
-            if (m_dirs_to_purge_b_remaining.find(dir) != m_dirs_to_purge_b_remaining.end()) {
+            if (m_purge_dirs.find(dir) != m_purge_dirs.end()) {
                 // There's nothing left to clean up in this directory
-                if (m_dirs_to_purge_b_remaining[dir] <= 0) {
+                if (m_purge_dirs[dir]->dir_b_remaining <= 0) {
                     continue;
                 }
 
                 // there's space left to clear. Get rid of as much of it as we need to
-                toRecoverFromDir = std::min(m_dirs_to_purge_b_remaining[dir], toRecoverFromLot);
-                
+                toRecoverFromDir = std::min(m_purge_dirs[dir]->dir_b_remaining, toRecoverFromLot);
             } else {
-                toRecoverFromDir = std::min(bytes, toRecoverFromLot);
-                m_dirs_to_purge_b_remaining[dir] = bytes;
+                // First time we've seen this dir as a candidate, record it
+                toRecoverFromDir = std::min(bytesInDir, toRecoverFromLot);
+                m_purge_dirs[dir] = std::make_unique<PurgeDirCandidateStats>(PurgeDirCandidateStats(0ll, bytesInDir));
             }
 
-            std::cout << "dir: " << dir << " reported usage: " << bytes << " usage remaining: " << m_dirs_to_purge_b_remaining[dir] << " toRecoverFromDir: " << toRecoverFromDir << " toRecoverFromLot: " << toRecoverFromLot << std::endl;
 
-            DirInfo update;
-            update.path = dir + "/"; // XRootD will seg fault if the path doesn't end in a slash
-            update.nBytesToRecover = toRecoverFromDir;
-            bytesRemaining -= toRecoverFromDir;
+            m_purge_dirs[dir]->dir_b_to_purge += toRecoverFromDir;
+            globalBRemaining -= toRecoverFromDir;
             toRecoverFromLot -= toRecoverFromDir;
-            m_dirs_to_purge_b_remaining[dir] -= toRecoverFromDir;
-            m_list.push_back(update);
+            m_purge_dirs[dir]->dir_b_remaining -= toRecoverFromDir;
+            std::cout << "   ADDING dir: " << dir << std::endl <<
+                "   dirUsage: " << bytesInDir <<  std::endl << 
+                "   bytes_to_purge: " << m_purge_dirs[dir]->dir_b_to_purge << std::endl << 
+                "   bytes_remaining: " << m_purge_dirs[dir]->dir_b_remaining << std::endl <<
+                "   toRecoverFromDir: " << toRecoverFromDir << std::endl <<
+                "   toRecoverFromLot: " << toRecoverFromLot << std::endl << 
+                "   GlobalBRemaining: " << globalBRemaining << std::endl;
+
+
         }
     }
 
-    std::cout << "   BYTES REMAINING AFTER " << getPolicyName(policy) << " POLICY: " << bytesRemaining << std::endl;
+    // std::cout << "   Added dirs to purge list for " << getPolicyName(policy) << " policy." << std::endl;
+    // for (const auto & [dir, stats] : m_purge_dirs) {
+    //     std::cout << "      dir: " << dir << " bytes_to_purge: " << stats->bytes_to_purge << " bytes_remaining: " << stats->bytes_remaining << std::endl;
+    // }
 
+    std::cout << "   TOTAL B REMAINING AFTER " << getPolicyName(policy) << " POLICY: " << globalBRemaining << std::endl;
     return;
 
 }
@@ -479,6 +495,9 @@ determination in the plugin.
 */
 long long XrdPurgeLotMan::GetBytesToRecover(const DataFsPurgeshot &purge_shot)
 {
+    // reset m_list
+    m_list.clear();
+    
     // Get all the lots
     char **lots;
     char *err;
@@ -517,45 +536,103 @@ long long XrdPurgeLotMan::GetBytesToRecover(const DataFsPurgeshot &purge_shot)
 
     long long bytesRemaining = bytesToRecover;
 
-    // Pretend policy: past_del, past_exp, past_opp, past_ded
-    std::cout << "BYTES REMAINING BEFORE DEL POLICY: " << bytesRemaining << std::endl;
-    lotsPastDelPolicy(purge_shot, bytesRemaining);
-    
-    std::cout << std::endl;
-    lotsPastExpPolicy(purge_shot, bytesRemaining);
 
-    std::cout << std::endl;
-    lotsPastOppPolicy(purge_shot, bytesRemaining);
 
-    std::cout << std::endl;
-    lotsPastDedPolicy(purge_shot, bytesRemaining);
+    applyPolicies(purge_shot, bytesRemaining);
 
     std::cout << std::endl << "   BYTES TO RECOVER: " << bytesToRecover << std::endl;
+
+    // TODO: Come back and consolidate this with the other member map to avoid duplicating keys like this.
+    for (const auto & [dir, stats] : m_purge_dirs) {
+        DirInfo update;
+        update.path = dir + "/"; // XRootD will seg fault if the path doesn't end in a slash
+        update.nBytesToRecover = stats->dir_b_to_purge;
+
+        m_list.push_back(update);
+    }
+
     for (const auto &dir : m_list)
     {
         std::cout << "   DIR: " << dir.path << " nBytesToRecover: " << dir.nBytesToRecover << std::endl;
     }
 
-
-
-
     return bytesToRecover;
+}
+
+bool XrdPurgeLotMan::validateConfiguration(const char *params)
+{
+    LotManConfiguration cfg{};
+
+    // Split params by space
+    std::istringstream iss(params);
+    std::vector<std::string> paramVec;
+    std::string token;
+    char delim = ' ';
+    
+    while (getline(iss, token, delim)) { 
+        paramVec.push_back(token); 
+    } 
+
+    for (const auto& part : paramVec) { 
+        std::cout << part << std::endl; 
+    } 
+
+    assert(paramVec.size() >= 1);
+
+    // Get LotHome
+    std::filesystem::path lot_home(paramVec[0]);
+    if (!std::filesystem::exists(lot_home) && !std::filesystem::is_directory(lot_home))
+    {
+        std::cout << "Lot home does not exist." << std::endl;
+        return false;
+    }
+    cfg.SetLotHome(lot_home.string());
+
+    std::vector<PurgePolicy> policies;
+    for (int i = 1; i < paramVec.size(); ++i)
+    {
+        PurgePolicy policy = getPolicyFromName(paramVec[i]);
+        if (policy == PurgePolicy::UnknownPolicy)
+        {
+            std::cout << "Unknown policy: " << paramVec[i] << std::endl;
+            return false;
+        }
+        policies.push_back(policy);
+    }
+
+
+    // Use default policies if none are provided
+    if (policies.empty())
+    {
+        policies = {PurgePolicy::PastDel, PurgePolicy::PastExp, PurgePolicy::PastOpp, PurgePolicy::PastDed};
+    }
+
+    cfg.SetPolicy(policies);
+
+    m_lotman_conf = cfg;
+
+    return true;
 }
 
 bool XrdPurgeLotMan::ConfigPurgePin(const char* params)
 {
     (void)params; // Avoid unused parameter warning
+
+    std::cout << std::endl << std::endl << "PARAMS: " << params << std::endl << std::endl;
+
+    if (!validateConfiguration(params)) {
+        std::cout << "COULD NOT VALIDATE CONFIGURATION" << std::endl;
+        return false;
+    };
+    
     char *err;
-    auto rv = lotman_set_context_str("lot_home", params, &err);
+    auto rv = lotman_set_context_str("lot_home", getLotHome().c_str(), &err);
     if (rv != 0)
     {
         std::cout << "Error setting lot home: " << err << std::endl;
         return false;
     }
 
-
-    // Load policy config
-    // TODO
 
 
     return true;
