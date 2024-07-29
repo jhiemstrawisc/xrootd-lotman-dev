@@ -65,11 +65,23 @@ PurgePolicy getPolicyFromName(std::string policy) {
 
 class XrdPurgeLotMan : public PurgePin
 {
+    XrdSysError *log;
 public:
     XrdPurgeLotMan();
     virtual ~XrdPurgeLotMan() override;
 
     const Configuration &conf = Cache::Conf();
+
+    virtual long long GetBytesToRecover(const DataFsPurgeshot&) override;
+    virtual bool ConfigPurgePin(const char* params) override;
+
+    long long GetConfiguredHWM();
+    long long GetConfiguredLWM();
+
+    // Custom deleter for unique pointers in which LM allocates some memory
+    // Used to guarantee we call `lotman_free_string_list` on these pointers
+    struct LotDeleter;
+
     class LotManConfiguration {
     public:
         LotManConfiguration() {}
@@ -94,19 +106,32 @@ public:
     };
 
     static const std::map<PurgePolicy, void (XrdPurgeLotMan::*)(const DataFsPurgeshot&, long long&)> policyFunctionMap;
-
     void applyPolicies(const DataFsPurgeshot &purge_shot, long long &bytesRemaining) {
         for (const auto &policy : m_lotman_conf.GetPolicy()) {
-            std::cout << "BYTES REMAINING BEFORE " << getPolicyName(policy) << " POLICY: " << bytesRemaining << std::endl;
             auto it = policyFunctionMap.find(policy);
             if (it != policyFunctionMap.end()) {
                 (this->*(it->second))(purge_shot, bytesRemaining);
             }
-            std::cout << std::endl;
         }
     }
-    virtual long long GetBytesToRecover(const DataFsPurgeshot&) override;
-    virtual bool ConfigPurgePin(const char* params) override;
+
+protected:
+    std::string getLotHome() {
+        return m_lotman_conf.GetLotHome();
+    }
+
+private:
+    std::map<std::string, std::unique_ptr<PurgeDirCandidateStats>> m_purge_dirs;
+    LotManConfiguration m_lotman_conf;
+
+    bool validateConfiguration(const char *params);
+
+    // indicates that these tend to clean out an entire lot, such as lots past deletion/expiration
+    void completePurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, PurgePolicy policy);
+    // whereas these only purge some of the storage, such as lots past opportunistic/dedicated storage
+    void partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, PurgePolicy policy);
+
+    std::map<std::string, long long> getLotUsageMap(char ***lots);
 
     // Policy implementations
     void lotsPastDelPolicy(const DataFsPurgeshot&, long long &bytesToRecover);
@@ -114,33 +139,8 @@ public:
     void lotsPastOppPolicy(const DataFsPurgeshot &purgeShot, long long &bytesRemaining);
     void lotsPastDedPolicy(const DataFsPurgeshot &purgeShot, long long &bytesRemaining);
 
-    static long long getTotalUsageB();
+    long long getTotalUsageB();
     std::map<std::string, long long> lotPerDirUsageB(const std::string &lot, const DataFsPurgeshot &purge_shot);
-
-    long long GetConfiguredHWM();
-    long long GetConfiguredLWM();
-
-    bool validateConfiguration(const char *params);
-    std::string getLotHome() {
-        return m_lotman_conf.GetLotHome();
-    }
-
-    
-
-protected:
-    // std::map<std::string, long long> m_dirs_to_purge_b;
-    // std::map<std::string, long long> m_dirs_to_purge_b_remaining;
-
-    std::map<std::string, std::unique_ptr<PurgeDirCandidateStats>> m_purge_dirs;
-    LotManConfiguration m_lotman_conf;
-
-private:
-    // indicates that these tend to clean out an entire lot, such as lots past deletion/expiration
-    void completePurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, PurgePolicy policy);
-    // whereas these only purge some of the storage, such as lots past opportunistic/dedicated storage
-    void partialPurgePolicyBase(const DataFsPurgeshot &purgeShot, long long &bytesRemaining, PurgePolicy policy);
-
-
 
 
 };
@@ -152,7 +152,6 @@ const std::map<PurgePolicy, void (XrdPurgeLotMan::*)(const DataFsPurgeshot&, lon
     {PurgePolicy::PastOpp, &XrdPurgeLotMan::lotsPastOppPolicy},
     {PurgePolicy::PastDed, &XrdPurgeLotMan::lotsPastDedPolicy}
 };
-
 }
 
 #endif // __XRDPURGELOTMAN_HH__
